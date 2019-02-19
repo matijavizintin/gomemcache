@@ -71,7 +71,7 @@ const (
 	// kept for any single address.
 	defaultMaxConns = 100
 
-	pollFillerPause = 10 * time.Millisecond
+	pollFilledPause = 10 * time.Millisecond
 )
 
 const buffered = 8 // arbitrary buffered channel size, for readability
@@ -203,25 +203,26 @@ func (c *Client) initialize() {
 
 func (c *Client) pollFiller(addr net.Addr) {
 	for {
-		time.Sleep(pollFillerPause)
-
 		c.lk.RLock()
 		conns := c.totalConn[addr.String()]
 		c.lk.RUnlock()
 
-		if conns < c.MaxConns {
-			conn, err := c.establishConn(addr)
-			if err != nil {
-				fmt.Printf("Error establishing a connection: %v\n", err)
-				continue
-			}
-			c.freeConn[addr.String()] <- conn
-			fmt.Printf("Connection established for addr: %s\n", addr.String())
-
-			c.lk.Lock()
-			c.totalConn[addr.String()] += 1
-			c.lk.Unlock()
+		if conns >= c.MaxConns {
+			time.Sleep(pollFilledPause)
+			continue
 		}
+
+		conn, err := c.establishConn(addr)
+		if err != nil {
+			fmt.Printf("Error establishing a connection: %v\n", err)
+			continue
+		}
+		c.freeConn[addr.String()] <- conn
+		fmt.Printf("Connection established for addr: %s\n", addr.String())
+
+		c.lk.Lock()
+		c.totalConn[addr.String()] += 1
+		c.lk.Unlock()
 	}
 }
 
