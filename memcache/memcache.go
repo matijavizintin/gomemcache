@@ -61,22 +61,17 @@ var (
 
 	// ErrNoServers is returned when no servers are configured or available.
 	ErrNoServers = errors.New("memcache: no servers configured or available")
-
-	// ErrNoFreeConnections is returned when a free connection can't be obtained before the timeout
-	ErrNoFreeConnections = errors.New("memcache: no free connections available")
 )
 
 const (
 	// defaultTimeout is the default socket read/write timeout.
 	defaultTimeout = 100 * time.Millisecond
 
-	// defaultMaxIdleConns is the default maximum number of idle connections
-	// kept for any single address.
-	defaultMaxIdleConns = 2
-
 	// defaultMaxConns is the default maximum number of connections
 	// kept for any single address.
 	defaultMaxConns = 100
+
+	pollFillerPause = 10 * time.Millisecond
 )
 
 const buffered = 8 // arbitrary buffered channel size, for readability
@@ -105,18 +100,14 @@ func New(options *Options) *Client {
 	ss.SetServers(options.Servers...)
 
 	c := &Client{
-		Timeout:      defaultTimeout,
-		MaxIdleConns: defaultMaxIdleConns,
-		MaxConns:     defaultMaxConns,
-		selector:     ss,
-		freeConn:     make(map[string]chan *conn),
-		totalConn:    make(map[string]int),
+		Timeout:   defaultTimeout,
+		MaxConns:  defaultMaxConns,
+		selector:  ss,
+		freeConn:  make(map[string]chan *conn),
+		totalConn: make(map[string]int),
 	}
 	if options.Timeout != 0 {
 		c.Timeout = options.Timeout
-	}
-	if options.MaxIdleConns != 0 {
-		c.MaxIdleConns = options.MaxIdleConns
 	}
 	if options.MaxConns != 0 {
 		c.MaxConns = options.MaxConns
@@ -127,10 +118,9 @@ func New(options *Options) *Client {
 }
 
 type Options struct {
-	Servers      []string
-	Timeout      time.Duration
-	MaxIdleConns int
-	MaxConns     int
+	Servers  []string
+	Timeout  time.Duration
+	MaxConns int
 }
 
 // Client is a memcache client.
@@ -139,14 +129,6 @@ type Client struct {
 	// Timeout specifies the socket read/write timeout.
 	// If zero, defaultTimeout is used.
 	Timeout time.Duration
-
-	// MaxIdleConns specifies the maximum number of idle connections that will
-	// be maintained per address. If less than one, defaultMaxIdleConns will be
-	// used.
-	//
-	// Consider your expected traffic rates and latency carefully. This should
-	// be set to a number higher than your peak parallel requests.
-	MaxIdleConns int
 
 	// MaxConns specified the maximum number of connections that can be established per address.
 	//
@@ -206,51 +188,51 @@ func (c *Client) condRelease(cn *conn, err *error) {
 	if *err == nil || resumableError(*err) {
 		cn.release()
 	} else {
-		c.closeConn(cn, true)
+		c.closeConn(cn)
 	}
 }
 
 func (c *Client) initialize() {
 	_ = c.selector.Each(func(addr net.Addr) error {
-		ch := make(chan *conn, c.MaxConns)
-		for i := 0; i < c.MaxIdleConns; i++ {
-			conn, err := c.establishConn(addr)
-			if err == nil {
-				ch <- conn
-			}
-		}
+		c.freeConn[addr.String()] = make(chan *conn, c.MaxConns)
 
-		c.freeConn[addr.String()] = ch
+		go c.pollFiller(addr)
 		return nil
 	})
 }
 
-func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
-	c.lk.RLock()
-	if c.totalConn[addr.String()] >= c.MaxIdleConns {
-		c.lk.RUnlock()
-		c.closeConn(cn, false)
-		return
-	}
-	c.lk.RUnlock()
+func (c *Client) pollFiller(addr net.Addr) {
+	for {
+		time.Sleep(pollFillerPause)
 
-	freeCh := c.freeConn[addr.String()]
-	select {
-	case freeCh <- cn:
-	default: // non-blocking
-		c.closeConn(cn, false)
+		c.lk.RLock()
+		conns := c.totalConn[addr.String()]
+		c.lk.RUnlock()
+
+		if conns < c.MaxConns {
+			conn, err := c.establishConn(addr)
+			if err != nil {
+				fmt.Printf("Error establishing a connection: %v\n", err)
+				continue
+			}
+			c.freeConn[addr.String()] <- conn
+			fmt.Printf("Connection established for addr: %s\n", addr.String())
+
+			c.lk.Lock()
+			c.totalConn[addr.String()] += 1
+			c.lk.Unlock()
+		}
 	}
 }
 
-func (c *Client) getFreeConn(addr net.Addr) (*conn, error) {
-	freeCh := c.freeConn[addr.String()]
+func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
+	c.freeConn[addr.String()] <- cn
+}
 
-	select {
-	case conn := <-freeCh:
-		return conn, nil
-	default:
-		return c.establishConn(addr)
-	}
+func (c *Client) getFreeConn(addr net.Addr) *conn {
+	conn := <-c.freeConn[addr.String()]
+	conn.extendDeadline()
+	return conn
 }
 
 // ConnectTimeoutError is the error type used when it takes
@@ -278,13 +260,6 @@ func (c *Client) dial(addr net.Addr) (net.Conn, error) {
 }
 
 func (c *Client) establishConn(addr net.Addr) (*conn, error) {
-	c.lk.RLock()
-	if c.totalConn[addr.String()] >= c.MaxConns {
-		c.lk.RUnlock()
-		return nil, ErrNoFreeConnections
-	}
-	c.lk.RUnlock()
-
 	nc, err := c.dial(addr)
 	if err != nil {
 		return nil, err
@@ -297,46 +272,20 @@ func (c *Client) establishConn(addr net.Addr) (*conn, error) {
 	}
 	cn.extendDeadline()
 
-	c.lk.Lock()
-	defer c.lk.Unlock()
-	conns := c.totalConn[addr.String()]
-	c.totalConn[addr.String()] = conns + 1
-
 	return cn, nil
 }
 
-func (c *Client) closeConn(cn *conn, reopen bool) {
+func (c *Client) closeConn(cn *conn) error {
 	addr := cn.addr
-	cn.nc.Close()
+	err := cn.nc.Close()
+	fmt.Printf("Connections closed. Err: %v\n", err)
 
 	c.lk.Lock()
 	defer c.lk.Unlock()
 	conns := c.totalConn[addr.String()] - 1
 	c.totalConn[addr.String()] = conns
 
-	if reopen {
-		go c.addConnToPool(addr)
-	}
-}
-
-func (c *Client) addConnToPool(addr net.Addr) {
-	c.lk.RLock()
-	if c.totalConn[addr.String()] >= c.MaxIdleConns {
-		c.lk.RUnlock()
-		return
-	}
-	c.lk.RUnlock()
-
-	conn, err := c.establishConn(addr)
-	if err != nil {
-		return
-	}
-
-	select {
-	case c.freeConn[addr.String()] <- conn:
-	default: // non-blocking
-		c.closeConn(conn, false)
-	}
+	return err
 }
 
 func (c *Client) onItem(item *Item, fn func(*Client, *bufio.ReadWriter, *Item) error) error {
@@ -344,10 +293,7 @@ func (c *Client) onItem(item *Item, fn func(*Client, *bufio.ReadWriter, *Item) e
 	if err != nil {
 		return err
 	}
-	cn, err := c.getFreeConn(addr)
-	if err != nil {
-		return err
-	}
+	cn := c.getFreeConn(addr)
 	defer c.condRelease(cn, &err)
 	if err = fn(c, cn.rw, item); err != nil {
 		return err
@@ -394,10 +340,7 @@ func (c *Client) withKeyAddr(key string, fn func(net.Addr) error) (err error) {
 }
 
 func (c *Client) withAddrRw(addr net.Addr, fn func(*bufio.ReadWriter) error) (err error) {
-	cn, err := c.getFreeConn(addr)
-	if err != nil {
-		return err
-	}
+	cn := c.getFreeConn(addr)
 	defer c.condRelease(cn, &err)
 	return fn(cn.rw)
 }
