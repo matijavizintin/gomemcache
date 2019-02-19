@@ -67,43 +67,19 @@ var (
 )
 
 const (
-	// DefaultTimeout is the default socket read/write timeout.
-	DefaultTimeout = 100 * time.Millisecond
+	// defaultTimeout is the default socket read/write timeout.
+	defaultTimeout = 100 * time.Millisecond
 
-	// DefaultMaxIdleConns is the default maximum number of idle connections
+	// defaultMaxIdleConns is the default maximum number of idle connections
 	// kept for any single address.
-	DefaultMaxIdleConns = 2
+	defaultMaxIdleConns = 2
 
-	// Default MaxConns is the default maximum number of connections
+	// defaultMaxConns is the default maximum number of connections
 	// kept for any single address.
-	DefaultMaxConns = 100
+	defaultMaxConns = 100
 )
 
 const buffered = 8 // arbitrary buffered channel size, for readability
-
-// resumableError returns true if err is only a protocol-level cache error.
-// This is used to determine whether or not a server connection should
-// be re-used or not. If an error occurs, by default we don't reuse the
-// connection, unless it was just a cache error.
-func resumableError(err error) bool {
-	switch err {
-	case ErrCacheMiss, ErrCASConflict, ErrNotStored, ErrMalformedKey:
-		return true
-	}
-	return false
-}
-
-func legalKey(key string) bool {
-	if len(key) > 250 {
-		return false
-	}
-	for i := 0; i < len(key); i++ {
-		if key[i] <= ' ' || key[i] == 0x7f {
-			return false
-		}
-	}
-	return true
-}
 
 var (
 	crlf            = []byte("\r\n")
@@ -124,28 +100,48 @@ var (
 // New returns a memcache client using the provided server(s)
 // with equal weight. If a server is listed multiple times,
 // it gets a proportional amount of weight.
-func New(server ...string) *Client {
+func New(options *Options) *Client {
 	ss := new(ServerList)
-	ss.SetServers(server...)
-	return NewFromSelector(ss)
-}
+	ss.SetServers(options.Servers...)
 
-// NewFromSelector returns a new Client using the provided ServerSelector.
-func NewFromSelector(ss ServerSelector) *Client {
-	c := &Client{selector: ss}
+	c := &Client{
+		Timeout:      defaultTimeout,
+		MaxIdleConns: defaultMaxIdleConns,
+		MaxConns:     defaultMaxConns,
+		selector:     ss,
+		freeConn:     make(map[string]chan *conn),
+		totalConn:    make(map[string]int),
+	}
+	if options.Timeout != 0 {
+		c.Timeout = options.Timeout
+	}
+	if options.MaxIdleConns != 0 {
+		c.MaxIdleConns = options.MaxIdleConns
+	}
+	if options.MaxConns != 0 {
+		c.MaxConns = options.MaxConns
+	}
+
 	c.initialize()
 	return c
+}
+
+type Options struct {
+	Servers      []string
+	Timeout      time.Duration
+	MaxIdleConns int
+	MaxConns     int
 }
 
 // Client is a memcache client.
 // It is safe for unlocked use by multiple concurrent goroutines.
 type Client struct {
 	// Timeout specifies the socket read/write timeout.
-	// If zero, DefaultTimeout is used.
+	// If zero, defaultTimeout is used.
 	Timeout time.Duration
 
 	// MaxIdleConns specifies the maximum number of idle connections that will
-	// be maintained per address. If less than one, DefaultMaxIdleConns will be
+	// be maintained per address. If less than one, defaultMaxIdleConns will be
 	// used.
 	//
 	// Consider your expected traffic rates and latency carefully. This should
@@ -199,7 +195,7 @@ func (cn *conn) release() {
 }
 
 func (cn *conn) extendDeadline() {
-	cn.nc.SetDeadline(time.Now().Add(cn.c.netTimeout()))
+	cn.nc.SetDeadline(time.Now().Add(cn.c.Timeout))
 }
 
 // condRelease releases this connection if the error pointed to by err
@@ -230,12 +226,15 @@ func (c *Client) initialize() {
 }
 
 func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
-	freeCh := c.freeConn[addr.String()]
-	if len(freeCh) >= c.maxIdleConns() {
+	c.lk.RLock()
+	if c.totalConn[addr.String()] >= c.MaxIdleConns {
+		c.lk.RUnlock()
 		c.closeConn(cn, false)
 		return
 	}
+	c.lk.RUnlock()
 
+	freeCh := c.freeConn[addr.String()]
 	select {
 	case freeCh <- cn:
 	default: // non-blocking
@@ -254,27 +253,6 @@ func (c *Client) getFreeConn(addr net.Addr) (*conn, error) {
 	}
 }
 
-func (c *Client) netTimeout() time.Duration {
-	if c.Timeout != 0 {
-		return c.Timeout
-	}
-	return DefaultTimeout
-}
-
-func (c *Client) maxIdleConns() int {
-	if c.MaxIdleConns > 0 {
-		return c.MaxIdleConns
-	}
-	return DefaultMaxIdleConns
-}
-
-func (c *Client) maxConns() int {
-	if c.MaxConns >= c.MaxIdleConns {
-		return c.MaxConns
-	}
-	return DefaultMaxConns
-}
-
 // ConnectTimeoutError is the error type used when it takes
 // too long to connect to the desired host. This level of
 // detail can generally be ignored.
@@ -287,7 +265,7 @@ func (cte *ConnectTimeoutError) Error() string {
 }
 
 func (c *Client) dial(addr net.Addr) (net.Conn, error) {
-	nc, err := net.DialTimeout(addr.Network(), addr.String(), c.netTimeout())
+	nc, err := net.DialTimeout(addr.Network(), addr.String(), c.Timeout)
 	if err == nil {
 		return nc, nil
 	}
@@ -301,7 +279,7 @@ func (c *Client) dial(addr net.Addr) (net.Conn, error) {
 
 func (c *Client) establishConn(addr net.Addr) (*conn, error) {
 	c.lk.RLock()
-	if c.totalConn[addr.String()] >= c.maxConns() {
+	if c.totalConn[addr.String()] >= c.MaxConns {
 		c.lk.RUnlock()
 		return nil, ErrNoFreeConnections
 	}
@@ -343,7 +321,7 @@ func (c *Client) closeConn(cn *conn, reopen bool) {
 
 func (c *Client) addConnToPool(addr net.Addr) {
 	c.lk.RLock()
-	if c.totalConn[addr.String()] >= c.maxIdleConns() {
+	if c.totalConn[addr.String()] >= c.MaxIdleConns {
 		c.lk.RUnlock()
 		return
 	}
@@ -754,4 +732,48 @@ func (c *Client) incrDecr(verb, key string, delta uint64) (uint64, error) {
 		return nil
 	})
 	return val, err
+}
+
+// resumableError returns true if err is only a protocol-level cache error.
+// This is used to determine whether or not a server connection should
+// be re-used or not. If an error occurs, by default we don't reuse the
+// connection, unless it was just a cache error.
+func resumableError(err error) bool {
+	switch err {
+	case ErrCacheMiss, ErrCASConflict, ErrNotStored, ErrMalformedKey:
+		return true
+	}
+	return false
+}
+
+func legalKey(key string) bool {
+	if len(key) > 250 {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		if key[i] <= ' ' || key[i] == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// TEST
+func (c *Client) ReportStats() map[string]map[string]int {
+	c.lk.Lock()
+	defer c.lk.Unlock()
+
+	report := map[string]map[string]int{}
+
+	report["freeConn"] = make(map[string]int)
+	for address, ch := range c.freeConn {
+		report["freeConn"][address] = len(ch)
+	}
+
+	report["totalConn"] = make(map[string]int)
+	for address, count := range c.totalConn {
+		report["totalConn"][address] = count
+	}
+
+	return report
 }
