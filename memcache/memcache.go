@@ -61,17 +61,22 @@ var (
 
 	// ErrNoServers is returned when no servers are configured or available.
 	ErrNoServers = errors.New("memcache: no servers configured or available")
+
+	// ErrNoFreeConns is returned when there are no free connections in the pool
+	ErrNoFreeConns = errors.New("memcache: no free connections in the pool")
 )
 
 const (
 	// defaultTimeout is the default socket read/write timeout.
 	defaultTimeout = 100 * time.Millisecond
 
+	defaultWaitForConnTimeout = 100 * time.Millisecond
+
 	// defaultMaxConns is the default maximum number of connections
 	// kept for any single address.
 	defaultMaxConns = 100
 
-	pollFilledPause = 10 * time.Millisecond
+	poolFilledPause = 10 * time.Millisecond
 )
 
 const buffered = 8 // arbitrary buffered channel size, for readability
@@ -100,14 +105,18 @@ func New(options *Options) *Client {
 	ss.SetServers(options.Servers...)
 
 	c := &Client{
-		Timeout:   defaultTimeout,
-		MaxConns:  defaultMaxConns,
-		selector:  ss,
-		freeConn:  make(map[string]chan *conn),
-		totalConn: make(map[string]int),
+		Timeout:                  defaultTimeout,
+		WaitForConnectionTimeout: defaultWaitForConnTimeout,
+		MaxConns:                 defaultMaxConns,
+		selector:                 ss,
+		freeConn:                 make(map[string]chan *conn),
+		totalConn:                make(map[string]int),
 	}
 	if options.Timeout != 0 {
 		c.Timeout = options.Timeout
+	}
+	if options.WaitForConnectionTimeout != 0 {
+		c.WaitForConnectionTimeout = options.WaitForConnectionTimeout
 	}
 	if options.MaxConns != 0 {
 		c.MaxConns = options.MaxConns
@@ -118,9 +127,10 @@ func New(options *Options) *Client {
 }
 
 type Options struct {
-	Servers  []string
-	Timeout  time.Duration
-	MaxConns int
+	Servers                  []string
+	Timeout                  time.Duration
+	WaitForConnectionTimeout time.Duration
+	MaxConns                 int
 }
 
 // Client is a memcache client.
@@ -129,6 +139,8 @@ type Client struct {
 	// Timeout specifies the socket read/write timeout.
 	// If zero, defaultTimeout is used.
 	Timeout time.Duration
+
+	WaitForConnectionTimeout time.Duration
 
 	// MaxConns specified the maximum number of connections that can be established per address.
 	//
@@ -196,19 +208,19 @@ func (c *Client) initialize() {
 	_ = c.selector.Each(func(addr net.Addr) error {
 		c.freeConn[addr.String()] = make(chan *conn, c.MaxConns)
 
-		go c.pollFiller(addr)
+		go c.poolFiller(addr)
 		return nil
 	})
 }
 
-func (c *Client) pollFiller(addr net.Addr) {
+func (c *Client) poolFiller(addr net.Addr) {
 	for {
 		c.lk.RLock()
 		conns := c.totalConn[addr.String()]
 		c.lk.RUnlock()
 
 		if conns >= c.MaxConns {
-			time.Sleep(pollFilledPause)
+			time.Sleep(poolFilledPause)
 			continue
 		}
 
@@ -230,10 +242,15 @@ func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
 	c.freeConn[addr.String()] <- cn
 }
 
-func (c *Client) getFreeConn(addr net.Addr) *conn {
-	conn := <-c.freeConn[addr.String()]
-	conn.extendDeadline()
-	return conn
+func (c *Client) getFreeConn(addr net.Addr) (*conn, error) {
+	timeout := time.After(c.WaitForConnectionTimeout)
+	select {
+	case conn := <-c.freeConn[addr.String()]:
+		conn.extendDeadline()
+		return conn, nil
+	case <-timeout:
+		return nil, ErrNoFreeConns
+	}
 }
 
 // ConnectTimeoutError is the error type used when it takes
@@ -294,7 +311,10 @@ func (c *Client) onItem(item *Item, fn func(*Client, *bufio.ReadWriter, *Item) e
 	if err != nil {
 		return err
 	}
-	cn := c.getFreeConn(addr)
+	cn, err := c.getFreeConn(addr)
+	if err != nil {
+		return err
+	}
 	defer c.condRelease(cn, &err)
 	if err = fn(c, cn.rw, item); err != nil {
 		return err
@@ -341,7 +361,10 @@ func (c *Client) withKeyAddr(key string, fn func(net.Addr) error) (err error) {
 }
 
 func (c *Client) withAddrRw(addr net.Addr, fn func(*bufio.ReadWriter) error) (err error) {
-	cn := c.getFreeConn(addr)
+	cn, err := c.getFreeConn(addr)
+	if err != nil {
+		return err
+	}
 	defer c.condRelease(cn, &err)
 	return fn(cn.rw)
 }
