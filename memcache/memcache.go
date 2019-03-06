@@ -226,11 +226,9 @@ func (c *Client) poolFiller(addr net.Addr) {
 
 		conn, err := c.establishConn(addr)
 		if err != nil {
-			fmt.Printf("Error establishing a connection: %v\n", err)
 			continue
 		}
 		c.freeConn[addr.String()] <- conn
-		fmt.Printf("Connection established for addr: %s\n", addr.String())
 
 		c.lk.Lock()
 		c.totalConn[addr.String()] += 1
@@ -296,7 +294,6 @@ func (c *Client) establishConn(addr net.Addr) (*conn, error) {
 func (c *Client) closeConn(cn *conn) error {
 	addr := cn.addr
 	err := cn.nc.Close()
-	fmt.Printf("Connections closed. Err: %v\n", err)
 
 	c.lk.Lock()
 	defer c.lk.Unlock()
