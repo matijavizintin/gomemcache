@@ -112,8 +112,6 @@ var keyBufPool = sync.Pool{
 }
 
 func (ss *ServerList) PickServer() (net.Addr, error) {
-	ss.mu.RLock()
-	defer ss.mu.RUnlock()
 	if len(ss.addrs) == 0 {
 		return nil, ErrNoServers
 	}
@@ -121,10 +119,12 @@ func (ss *ServerList) PickServer() (net.Addr, error) {
 		return ss.addrs[0], nil
 	}
 
+	ss.mu.Lock()
 	ss.rr++
 	if ss.rr >= len(ss.addrs) {
 		ss.rr = 0
 	}
+	ss.mu.Unlock()
 
 	return ss.addrs[ss.rr], nil
 }
