@@ -307,7 +307,7 @@ func (c *Client) closeConn(cn *conn) error {
 }
 
 func (c *Client) onItem(item *Item, fn func(*Client, *bufio.ReadWriter, *Item) error) error {
-	addr, err := c.selector.PickServer(item.Key)
+	addr, err := c.selector.PickServer()
 	if err != nil {
 		return err
 	}
@@ -353,7 +353,7 @@ func (c *Client) withKeyAddr(key string, fn func(net.Addr) error) (err error) {
 	if !legalKey(key) {
 		return ErrMalformedKey
 	}
-	addr, err := c.selector.PickServer(key)
+	addr, err := c.selector.PickServer()
 	if err != nil {
 		return err
 	}
@@ -457,7 +457,7 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 		if !legalKey(key) {
 			return nil, ErrMalformedKey
 		}
-		addr, err := c.selector.PickServer(key)
+		addr, err := c.selector.PickServer()
 		if err != nil {
 			return nil, err
 		}

@@ -17,7 +17,6 @@ limitations under the License.
 package memcache
 
 import (
-	"hash/crc32"
 	"net"
 	"strings"
 	"sync"
@@ -31,7 +30,7 @@ import (
 type ServerSelector interface {
 	// PickServer returns the server address that a given item
 	// should be shared onto.
-	PickServer(key string) (net.Addr, error)
+	PickServer() (net.Addr, error)
 	Each(func(net.Addr) error) error
 }
 
@@ -39,6 +38,7 @@ type ServerSelector interface {
 type ServerList struct {
 	mu    sync.RWMutex
 	addrs []net.Addr
+	rr    int
 }
 
 // staticAddr caches the Network() and String() values from any net.Addr.
@@ -111,7 +111,7 @@ var keyBufPool = sync.Pool{
 	},
 }
 
-func (ss *ServerList) PickServer(key string) (net.Addr, error) {
+func (ss *ServerList) PickServer() (net.Addr, error) {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
 	if len(ss.addrs) == 0 {
@@ -120,10 +120,11 @@ func (ss *ServerList) PickServer(key string) (net.Addr, error) {
 	if len(ss.addrs) == 1 {
 		return ss.addrs[0], nil
 	}
-	bufp := keyBufPool.Get().(*[]byte)
-	n := copy(*bufp, key)
-	cs := crc32.ChecksumIEEE((*bufp)[:n])
-	keyBufPool.Put(bufp)
 
-	return ss.addrs[cs%uint32(len(ss.addrs))], nil
+	ss.rr++
+	if ss.rr >= len(ss.addrs) {
+		ss.rr = 0
+	}
+
+	return ss.addrs[ss.rr], nil
 }
