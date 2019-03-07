@@ -17,6 +17,7 @@ limitations under the License.
 package memcache
 
 import (
+	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -38,7 +39,6 @@ type ServerSelector interface {
 type ServerList struct {
 	mu    sync.RWMutex
 	addrs []net.Addr
-	rr    int
 }
 
 // staticAddr caches the Network() and String() values from any net.Addr.
@@ -119,12 +119,5 @@ func (ss *ServerList) PickServer() (net.Addr, error) {
 		return ss.addrs[0], nil
 	}
 
-	ss.mu.Lock()
-	ss.rr++
-	if ss.rr >= len(ss.addrs) {
-		ss.rr = 0
-	}
-	ss.mu.Unlock()
-
-	return ss.addrs[ss.rr], nil
+	return ss.addrs[rand.Intn(len(ss.addrs))], nil
 }
